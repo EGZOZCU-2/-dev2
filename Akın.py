@@ -5,13 +5,13 @@ import ipaddress
 import os
 import subprocess
 import time
-import sys # sys kütüphanesi eklendi, etkileşimli çıkış için
+import sys
 from typing import List, Tuple, Dict, Any
 
 # --- Yapılandırma ve Varsayılanlar ---
 DEFAULT_PORTS = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 587, 3306, 3389, 8080]
 MAX_WORKERS = 150
-PING_TIMEOUT = 3
+PING_TIMEOUT = 1.5 # Timeout biraz daha düşürüldü, daha hızlı sonuç için
 SCAN_TIMEOUT = 1
 BANNER_TIMEOUT = 1
 RECV_SIZE = 2048
@@ -21,7 +21,6 @@ RECV_SIZE = 2048
 def parse_ports(port_input: str) -> List[int]:
     """
     Port aralığı girişi için esneklik sağlayan fonsiyon.
-    Kullanıcı '80,443,1000-1010' gibi karmaşık girdiler verebilir.
     """
     ports = set()
     parts = port_input.split(',')
@@ -61,7 +60,8 @@ def ping_host(host: str) -> Tuple[str, bool]:
     Windows ve Linux'taki komut farklılıklarını hallediyoruz.
     """
     param = "-n" if os.name == "nt" else "-c"
-    command = ["ping", param, "1", host]
+    # Linux'ta ping için -c 1 (1 paket), -W 1 (1 saniye timeout) kullanılır
+    command = ["ping", param, "1", "-W", str(PING_TIMEOUT), host] if os.name != "nt" else ["ping", param, "1", "-w", str(int(PING_TIMEOUT*1000)), host]
     
     try:
         startupinfo = None
@@ -73,18 +73,26 @@ def ping_host(host: str) -> Tuple[str, bool]:
             command, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
-            text=True, # text=True eklendi
-            timeout=PING_TIMEOUT,
+            text=True,
+            timeout=PING_TIMEOUT + 1, # Ekstra zaman tanıyoruz
             startupinfo=startupinfo
         )
-        # Çıktıda TTL veya "1 received" kontrolü
-        return host, (result.returncode == 0 and ("TTL=" in result.stdout or "1 received" in result.stdout or "0% packet loss" in result.stdout))
+        
+        # Ping başarılıysa returncode 0'dır VE çıktı TTL, 1 received vb. içermelidir.
+        is_successful = (result.returncode == 0) and ("TTL=" in result.stdout or "1 received" in result.stdout or "0% packet loss" in result.stdout)
+        
+        # Ek bir kontrol: Eğer ağa yol yoksa ping atamaz, bu durumda da False dönmeli.
+        if "Destination Host Unreachable" in result.stdout or "ağ üzerinden yol yok" in result.stdout:
+            return host, False
+            
+        return host, is_successful
+    
     except (subprocess.TimeoutExpired, subprocess.SubprocessError):
         return host, False
 
 def list_hosts(network: str) -> List[str]:
     """
-    Verilen CIDR bloğundaki (örn: 192.168.1.0/24) tüm IP'lere hızlıca ping atıp
+    Verilen CIDR bloğundaki tüm IP'lere hızlıca ping atıp
     cevap verenleri 'aktif host' olarak listeye ekleyen fonksiyon.
     """
     try:
@@ -104,7 +112,6 @@ def list_hosts(network: str) -> List[str]:
             host, status = f.result()
             if status:
                 live.append(host)
-                # Buraya anlık çıktı eklemedik, hepsi bitince listeleyeceğiz.
             
     return live
 
@@ -127,21 +134,21 @@ def banner_grab(host: str, port: int) -> str:
             s.settimeout(BANNER_TIMEOUT)
             s.connect((host, port))
             
+            # Sunucuyu konuşturmak için istek gönder
             if port in [21, 25, 110, 143]:
                 s.sendall(b"HELP\r\n")
             elif port == 80 or port == 443:
                 s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + host.encode() + b"\r\n\r\n")
             
             data = s.recv(RECV_SIZE)
+            # Gelen cevabın sadece ilk temizlenmiş satırını al
             return data.decode(errors="ignore").strip().split('\n')[0]
             
     except (socket.timeout, socket.error, OSError):
         return "Banner Alınamadı (Timeout/Hata)"
 
 def scan_ports(host: str, ports: List[int]) -> Dict[str, Any]:
-    """
-    Port taramasını ve banner grabbing'i yöneten ana fonksiyon.
-    """
+    """Port taramasını ve banner grabbing'i yöneten ana fonksiyon."""
     open_ports: List[int] = []
     banners: Dict[int, str] = {}
     
@@ -170,18 +177,14 @@ def scan_ports(host: str, ports: List[int]) -> Dict[str, Any]:
 # --- Programın Ana Giriş Noktası ---
 
 def main():
-    """
-    Kullanıcı arayüzünü yöneten, zamanı tutan ve sonuçları ekrana basan ana motor.
-    """
-    # Argüman zorunluluğunu kaldırıyoruz ve sadece tek bir "target" bekliyoruz.
+    """Kullanıcı arayüzünü yöneten ana motor."""
     parser = argparse.ArgumentParser(
         prog="Akın",
         description="Kali Linux'a özel, hızlı ağ keşif ve port tarama aracı."
     )
     
-    # nargs='?' ile target'ı isteğe bağlı yapıyoruz.
+    # Argüman zorunluluğu kaldırıldı: target isteğe bağlı.
     parser.add_argument("target", nargs='?', help="Taranacak tek IP (Örn: 192.168.1.10) veya Ağ Bloğu (Örn: 192.168.1.0/24).")
-    
     parser.add_argument("-p", "--ports", help="Özel port aralığı (Örn: 21,80,443,1000-2000). Yoksa varsayılan portları kullanırız.")
     
     args = parser.parse_args()
@@ -203,13 +206,12 @@ def main():
     # --- Hedef Türünü Otomatik Ayırt Etme ---
     is_network = False
     try:
-        # Girdi bir CIDR bloğu mu?
-        ipaddress.ip_network(target, strict=False) 
-        # Eğer bir CIDR bloğu ise, IP host sayısına bakılarak ayırt edilir.
-        if "/" in target and ipaddress.ip_network(target, strict=False).prefixlen < 32:
+        # Girdi bir CIDR bloğu mu? (Örn: 10.10.10.0/24)
+        net_info = ipaddress.ip_network(target, strict=False) 
+        if "/" in target and net_info.prefixlen < 32:
              is_network = True
         elif "/" not in target:
-             # Eğer / yoksa ve sadece IP formatındaysa host olarak kabul et
+             # Eğer / yoksa ve tek IP'ye benziyorsa host olarak kabul et
              ipaddress.ip_address(target)
              is_network = False
         
@@ -276,6 +278,6 @@ def main():
     print("="*50)
 
 
-# YAZIM HATASI DÜZELTİLDİ: name yerine _name_ kullanıldı.
+# KRİTİK DÜZELTME: if name == "main": hatası düzeltildi!
 if _name_ == "_main_":
     main()
