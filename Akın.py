@@ -1,283 +1,129 @@
-import argparse
-import socket
-import concurrent.futures
-import ipaddress
-import os
 import subprocess
-import time
+import platform
+import ipaddress
 import sys
-from typing import List, Tuple, Dict, Any
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import time
 
-# --- Yapılandırma ve Varsayılanlar ---
-DEFAULT_PORTS = [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 587, 3306, 3389, 8080]
-MAX_WORKERS = 150
-PING_TIMEOUT = 1.5 # Timeout biraz daha düşürüldü, daha hızlı sonuç için
-SCAN_TIMEOUT = 1
-BANNER_TIMEOUT = 1
-RECV_SIZE = 2048
+# Host tarama işlemi için maksimum iş parçacığı (thread) sayısı
+# Ev ağları için 254 IP'yi aynı anda işlemek idealdir.
+MAX_THREADS = 254 
 
-# --- Küçük Yardımcı Fonksiyonlar ---
-
-def parse_ports(port_input: str) -> List[int]:
+def ping_host(ip_adresi):
     """
-    Port aralığı girişi için esneklik sağlayan fonsiyon.
+    Belirtilen IP adresine ping atar ve erişilebilirliği kontrol eder.
+    Bir tuple (ip, True/False) döndürür.
     """
-    ports = set()
-    parts = port_input.split(',')
     
-    for part in parts:
-        part = part.strip()
-        if not part: continue
-            
-        if '-' in part:
-            try:
-                start, end = map(int, part.split('-'))
-                if not (1 <= start <= 65535 and start <= end):
-                    raise ValueError
-                ports.update(range(start, end + 1)) 
-            except ValueError:
-                print(f"[!] Kardeşim, port aralığı formatın hatalı: {part}. Şunu dene: 1-1000")
-                return []
-        else:
-            try:
-                port = int(part)
-                if 1 <= port <= 65535:
-                    ports.add(port)
-                else:
-                    print(f"[!] Port numarası 1 ile 65535 arasında olmalı: {port}")
-                    return []
-            except ValueError:
-                print(f"[!] Port numarasını sayı olarak girmen gerekiyor: {part}")
-                return []
-
-    return sorted(list(ports)) 
-
-# --- Ağ Keşfi (Canlı Hostları Bulma) ---
-
-def ping_host(host: str) -> Tuple[str, bool]:
-    """
-    Hostun hayatta olup olmadığını kontrol eden klasik ping fonksiyonu.
-    Windows ve Linux'taki komut farklılıklarını hallediyoruz.
-    """
-    param = "-n" if os.name == "nt" else "-c"
-    # Linux'ta ping için -c 1 (1 paket), -W 1 (1 saniye timeout) kullanılır
-    command = ["ping", param, "1", "-W", str(PING_TIMEOUT), host] if os.name != "nt" else ["ping", param, "1", "-w", str(int(PING_TIMEOUT*1000)), host]
-    
+    # İşletim sistemine göre ping komutu ayarı (Tek paket ve hızlı timeout)
+    if platform.system() == "Windows":
+        # -n 1 (1 paket), -w 500 (500 ms timeout)
+        komut = ["ping", "-n", "1", "-w", "500", str(ip_adresi)]
+    else:
+        # -c 1 (1 paket), -W 1 (1 saniye timeout)
+        komut = ["ping", "-c", "1", "-W", "1", str(ip_adresi)]
+        
     try:
-        startupinfo = None
-        if os.name == "nt":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
+        # Komutu çalıştırır
+        # timeout=1 ekleyerek ping'in maksimum 1 saniye beklemesini sağlıyoruz
         result = subprocess.run(
-            command, 
+            komut, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
             text=True,
-            timeout=PING_TIMEOUT + 1, # Ekstra zaman tanıyoruz
-            startupinfo=startupinfo
+            timeout=1  
         )
         
-        # Ping başarılıysa returncode 0'dır VE çıktı TTL, 1 received vb. içermelidir.
-        is_successful = (result.returncode == 0) and ("TTL=" in result.stdout or "1 received" in result.stdout or "0% packet loss" in result.stdout)
+        # returncode 0 ise komut hatasız çalışmıştır
+        if result.returncode == 0:
+            # Çıktıda 'TTL' (Time-to-Live) veya '1 received' varsa aktiftir
+            if "TTL=" in result.stdout or "1 received" in result.stdout or "0% packet loss" in result.stdout:
+                return (ip_adresi, True)
         
-        # Ek bir kontrol: Eğer ağa yol yoksa ping atamaz, bu durumda da False dönmeli.
-        if "Destination Host Unreachable" in result.stdout or "ağ üzerinden yol yok" in result.stdout:
-            return host, False
-            
-        return host, is_successful
-    
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError):
-        return host, False
-
-def list_hosts(network: str) -> List[str]:
-    """
-    Verilen CIDR bloğundaki tüm IP'lere hızlıca ping atıp
-    cevap verenleri 'aktif host' olarak listeye ekleyen fonksiyon.
-    """
-    try:
-        net = ipaddress.ip_network(network, strict=False) 
-    except ValueError:
-        print(f"[!] Hatalı ağ formatı: {network}. Lütfen kontrol et.")
-        return []
+        return (ip_adresi, False)
         
-    hosts = [str(h) for h in net.hosts()]
-    live: List[str] = []
+    except subprocess.TimeoutExpired:
+        # Zaman aşımı olursa pasif say
+        return (ip_adresi, False)
+    except Exception:
+        # Diğer hatalar (izin hatası vb.)
+        return (ip_adresi, False)
+
+
+def scan_network(network_range):
+    """Verilen network aralığındaki hostları paralel olarak tarar."""
     
-    print(f"[*] Ping Tarama başladı: {network} bloğunda {len(hosts)} IP var.")
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(ping_host, h) for h in hosts] 
-        for f in concurrent.futures.as_completed(futures):
-            host, status = f.result()
-            if status:
-                live.append(host)
-            
-    return live
-
-# --- Port Tarama ve Servis Tespiti ---
-
-def scan_port(host: str, port: int) -> Tuple[int, bool]:
-    """Basit TCP port taraması."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(SCAN_TIMEOUT)
-            s.connect((host, port))
-            return port, True
-    except (socket.timeout, socket.error, OSError):
-        return port, False
-
-def banner_grab(host: str, port: int) -> str:
-    """Açık porttan hizmet bilgisini (Banner) yakalamaya çalışırız."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(BANNER_TIMEOUT)
-            s.connect((host, port))
-            
-            # Sunucuyu konuşturmak için istek gönder
-            if port in [21, 25, 110, 143]:
-                s.sendall(b"HELP\r\n")
-            elif port == 80 or port == 443:
-                s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + host.encode() + b"\r\n\r\n")
-            
-            data = s.recv(RECV_SIZE)
-            # Gelen cevabın sadece ilk temizlenmiş satırını al
-            return data.decode(errors="ignore").strip().split('\n')[0]
-            
-    except (socket.timeout, socket.error, OSError):
-        return "Banner Alınamadı (Timeout/Hata)"
-
-def scan_ports(host: str, ports: List[int]) -> Dict[str, Any]:
-    """Port taramasını ve banner grabbing'i yöneten ana fonksiyon."""
-    open_ports: List[int] = []
-    banners: Dict[int, str] = {}
+    start_time = time.time()
     
-    print(f"[*] Port Tarama başladı: {host} üzerinde {len(ports)} port taranıyor.")
+    try:
+        ag = ipaddress.ip_network(network_range, strict=False)
+        all_hosts = [str(host) for host in ag.hosts()]
+    except ValueError as e:
+        print(f"❌ Hata: Hatalı IP aralığı formatı girdin. {e}")
+        print("Örnek format: 192.168.1.0/24")
+        sys.exit(1)
+        
+    # Başlangıç ve bitiş adreslerini (Network ve Broadcast) taramadan hariç tut
+    hosts_to_scan = [ip for ip in all_hosts if ip != str(ag.network_address) and ip != str(ag.broadcast_address)]
+    
+    print(f"\n=======================================================")
+    print(f"✅ Network Tarayıcı Başlatılıyor...")
+    print(f"📡 Hedeflenen Ağ: {network_range} ({len(hosts_to_scan)} olası host)")
+    print(f"⚡ Paralel İşlem Sayısı: {MAX_THREADS}")
+    print(f"=======================================================\n")
+    
+    aktif_hostlar = []
+    pasif_host_sayisi = 0
 
-    # 1. Aşama: Port Tarama (Hızlı TCP Bağlantı Denemeleri)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(scan_port, host, p) for p in ports]
-        for f in concurrent.futures.as_completed(futures):
-            port, status = f.result()
-            if status:
-                open_ports.append(port)
-                
-    # 2. Aşama: Banner Grabbing (Sadece Açık Portlar İçin Detay Toplama)
-    if open_ports:
-        print("[*] Açık portlar bulundu! Şimdi servis bilgilerini (Banner) çekiyoruz...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_banners = {executor.submit(banner_grab, host, p): p for p in open_ports}
-            for future in concurrent.futures.as_completed(future_banners):
-                port = future_banners[future]
-                banner = future.result()
-                banners[port] = banner
-            
-    return {"open_ports": open_ports, "banners": banners}
+    # ThreadPoolExecutor kullanarak ping_host fonksiyonunu paralel çalıştır
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        # executor.map, ping_host fonksiyonunu hosts_to_scan listesindeki her elemana uygular.
+        # Bu işlem eş zamanlı (concurrent) olarak yapılır.
+        results = executor.map(ping_host, hosts_to_scan)
 
-# --- Programın Ana Giriş Noktası ---
+        # Sonuçları işleme
+        for ip, is_up in results:
+            if is_up:
+                print(f"🟢 {ip:<15} -> Aktif (UP)")
+                aktif_hostlar.append(ip)
+            else:
+                pasif_host_sayisi += 1
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+
+    # Sonuçların Özeti
+    print("\n------------------- Tarama Özeti ----------------------")
+    print(f"⏰ Toplam Süre: {elapsed_time:.2f} saniye")
+    print(f"✅ Aktif Host Sayısı: {len(aktif_hostlar)}")
+    print(f"❌ Pasif Host Sayısı: {pasif_host_sayisi}")
+    print("-------------------------------------------------------")
+    
+    if aktif_hostlar:
+        print("\n💰 **BULUNAN AKTİF HOSTLAR:**")
+        for ip in aktif_hostlar:
+            print(f"   - {ip}")
+
 
 def main():
-    """Kullanıcı arayüzünü yöneten ana motor."""
+    """Aracın komut satırı argümanlarını yönetir."""
     parser = argparse.ArgumentParser(
-        prog="Akın",
-        description="Kali Linux'a özel, hızlı ağ keşif ve port tarama aracı."
+        description="Paralel Ping Tarayıcı: Belirtilen CIDR aralığındaki hostları tespit eder ve erişilebilirliğini kontrol eder.",
+        epilog="Kullanım Örneği: python SuperScanner.py 192.168.1.0/24"
     )
     
-    # Argüman zorunluluğu kaldırıldı: target isteğe bağlı.
-    parser.add_argument("target", nargs='?', help="Taranacak tek IP (Örn: 192.168.1.10) veya Ağ Bloğu (Örn: 192.168.1.0/24).")
-    parser.add_argument("-p", "--ports", help="Özel port aralığı (Örn: 21,80,443,1000-2000). Yoksa varsayılan portları kullanırız.")
+    # Network aralığını zorunlu argüman olarak tanımla
+    parser.add_argument(
+        "network_range",
+        type=str,
+        help="Taranacak Network aralığı (CIDR formatında, örn: 192.168.1.0/24)"
+    )
     
     args = parser.parse_args()
-
-    # --- Etkileşimli Giriş ---
-    if not args.target:
-        print("\n" + "="*50)
-        print("🎯 Akın Tarayıcı Başlatılıyor...")
-        print("="*50)
-        target = input("Lütfen taramak istediğiniz IP veya Network bloğunu girin: ")
-        if not target.strip():
-            print("[!] Geçerli bir hedef girmedin. Çıkılıyor.")
-            sys.exit(1)
-        args.target = target
     
-    target = args.target
-    start_time = time.time()
+    # Tarama fonksiyonunu başlat
+    scan_network(args.network_range)
 
-    # --- Hedef Türünü Otomatik Ayırt Etme ---
-    is_network = False
-    try:
-        # Girdi bir CIDR bloğu mu? (Örn: 10.10.10.0/24)
-        net_info = ipaddress.ip_network(target, strict=False) 
-        if "/" in target and net_info.prefixlen < 32:
-             is_network = True
-        elif "/" not in target:
-             # Eğer / yoksa ve tek IP'ye benziyorsa host olarak kabul et
-             ipaddress.ip_address(target)
-             is_network = False
-        
-    except ValueError:
-        # Format hatası varsa
-        print(f"[!] Hatalı IP veya Ağ formatı girdin: {target}")
-        return
-
-    # --- Çalışma Moduna Göre Yönlendir ---
-    
-    if is_network:
-        # --- Ağ Tarama Modu ---
-        try:
-            live_hosts = list_hosts(target)
-            
-            print("\n" + "="*50)
-            print(f"** 🌍 Akın Ağ Tarama Sonucu: {target} **")
-            print("="*50)
-            
-            if live_hosts:
-                print(f"🎉 *Aktif Host Sayısı:* {len(live_hosts)} tanesini buldum!")
-                for h in live_hosts:
-                    print(f"  - 🟢 {h}")
-            else:
-                print("❌ Üzgünüm, bu ağda aktif host yok gibi görünüyor.")
-                
-        except ValueError as e:
-            print(f"[!] Hatalı ağ formatı: {e}")
-        
-    else:
-        # --- Host Tarama Modu ---
-        host = target
-        
-        ports_to_scan = []
-        if args.ports:
-            ports_to_scan = parse_ports(args.ports)
-        else:
-            ports_to_scan = DEFAULT_PORTS
-        
-        if not ports_to_scan:
-            return
-            
-        scan_results = scan_ports(host, ports_to_scan)
-        
-        # Sonuçları Temizce Yazdır
-        print("\n" + "="*50)
-        print(f"** 🎯 Akın Host Tarama Sonuçları: {host} **")
-        print("="*50)
-        
-        if scan_results["open_ports"]:
-            print(f"✅ *Açık Portlar:* {len(scan_results['open_ports'])} kapı aralık!")
-            for p in scan_results["open_ports"]:
-                banner = scan_results["banners"].get(p, "Banner Alınamadı")
-                service_name = socket.getservbyport(p, 'tcp') if 1 <= p <= 65535 else 'Bilinmiyor'
-                print(f"  - *{p}/tcp* ({service_name})")
-                print(f"    -> Servis Bilgisi: {banner.strip()}")
-        else:
-            print(f"❌ {len(ports_to_scan)} port taranmasına rağmen açık port bulamadık.")
-    
-    # --- Bitiş ---
-    end_time = time.time()
-    print("\n" + "="*50)
-    print(f"⌛ Akın Tarama Tamamlandı: {end_time - start_time:.2f} saniyede bitirdik. Hızlıyız! 🏎")
-    print("="*50)
-
-
-# KRİTİK DÜZELTME: if name == "main": hatası düzeltildi!
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
